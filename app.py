@@ -120,6 +120,7 @@ def _init_state():
         "xmls_carregados": [],     # [(nome, bytes), ...]
         "faltantes": [],           # lista de dicts
         "resultados": [],          # lista processada
+        "mapa_fiscal": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -236,7 +237,7 @@ if st.session_state.stage == "input":
         plan_fiscal = st.file_uploader(
             "Planilha XML F5",
             type=["xlsx", "xls", "csv"],
-            help="Planilha com colunas SKU, Siscomex e AFRMM.",
+            help="Planilha F5 ou espelho HAGN008 com SKU/Part Number, Siscomex, AFRMM e, se houver, Base/Alq/Valor de IBS e CBS.",
         )
 
     st.divider()
@@ -312,7 +313,7 @@ if st.session_state.stage == "input":
             with st.spinner("Processando XMLs..."):
                 mapa_ean = get_all_eans()
                 for nome, xml_bytes in xmls_carregados:
-                    xml_out, stats = processar_xml(xml_bytes, mapa_ean, nome)
+                    xml_out, stats = processar_xml(xml_bytes, mapa_ean, nome, st.session_state.mapa_fiscal)
                     resultados.append({"nome_original": nome, "xml_processado": xml_out, "stats": stats})
             st.session_state.resultados = resultados
             st.session_state.stage = "results"
@@ -391,7 +392,7 @@ elif st.session_state.stage == "fill_ean":
         resultados = []
         with st.spinner("Processando XMLs..."):
             for nome, xml_bytes in st.session_state.xmls_carregados:
-                xml_out, stats = processar_xml(xml_bytes, mapa_ean, nome)
+                xml_out, stats = processar_xml(xml_bytes, mapa_ean, nome, st.session_state.mapa_fiscal)
                 resultados.append({"nome_original": nome, "xml_processado": xml_out, "stats": stats})
 
         st.session_state.resultados = resultados
@@ -416,14 +417,16 @@ elif st.session_state.stage == "results":
     total_ean_criados = sum(r["stats"].get("ean_criados", 0) for r in resultados)
     total_ean_ausentes = sum(r["stats"].get("ean_ausentes", 0) for r in resultados)
     total_icms = sum(r["stats"].get("icms_zerados", 0) for r in resultados)
+    total_ibscbs = sum(r["stats"].get("ibscbs_itens_gerados", 0) for r in resultados)
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     for col, num, lbl in [
         (c1, total_xml, "XMLs processados"),
         (c2, total_ok, "Com sucesso"),
         (c3, total_ean_criados, "EANs inseridos"),
         (c4, total_ean_ausentes, "Itens sem EAN"),
         (c5, total_icms, "ICMS zerados"),
+        (c6, total_ibscbs, "IBS/CBS gerados"),
     ]:
         col.markdown(_stat_card(num, lbl), unsafe_allow_html=True)
 
@@ -479,12 +482,13 @@ elif st.session_state.stage == "results":
                 st.write(f"Preservados (sem base): {s['ean_preservados']} · Ausentes: {s['ean_ausentes']}")
             with col_b:
                 st.markdown("**ICMS / Fiscal**")
-                st.write(f"ICMS zerados: {s['icms_zerados']} · infCpl limpos: {s['infcpl_limpa']}")
-                st.write(f"cFabricante: {s['cfabricante_inseridos']} ins / {s['cfabricante_atualizados']} upd")
+                st.write(f"CFOP ajustados: {s.get('cfop_ajustados', 0)} · ICMS zerados: {s['icms_zerados']}")
+                st.write(f"infCpl limpos: {s['infcpl_limpa']} · cFabricante: {s['cfabricante_inseridos']} ins / {s['cfabricante_atualizados']} upd")
             with col_c:
-                st.markdown("**IPI / PIS / COFINS**")
+                st.markdown("**IPI / PIS / COFINS / IBS-CBS**")
                 st.write(f"IPI CST→03: {s['ipi_cst_alterados']+s['ipi_cst_criados']}")
                 st.write(f"PIS CST→50: {s['pis_cst_alterados']} · COFINS: {s['cofins_cst_alterados']}")
+                st.write(f"IBS/CBS: {s.get('ibscbs_itens_gerados', 0)} item(ns) · total: {s.get('ibscbs_totais_gerados', 0)}")
 
             # Itens sem EAN deste arquivo
             falt = s.get("faltantes_detalhado", [])

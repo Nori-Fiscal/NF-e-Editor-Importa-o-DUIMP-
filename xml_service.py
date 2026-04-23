@@ -84,6 +84,7 @@ def _novo_stats() -> Dict:
 
         # ICMS
         "icms_zerados": 0,
+        "cfop_ajustados": 0,
         "infcpl_limpa": 0,
 
         # IPI / PIS / COFINS
@@ -91,6 +92,10 @@ def _novo_stats() -> Dict:
         "ipi_cst_criados": 0,
         "pis_cst_alterados": 0,
         "cofins_cst_alterados": 0,
+
+        # IBS / CBS
+        "ibscbs_itens_gerados": 0,
+        "ibscbs_totais_gerados": 0,
 
         "avisos": [],
         "erros": [],
@@ -233,6 +238,13 @@ def _inserir_cfabricante(root: etree._Element, stats: Dict) -> None:
 # 3. ICMS — zera todos os valores monetários; limpa infCpl
 # ---------------------------------------------------------------------------
 
+def _ajustar_cfop(root: etree._Element, stats: Dict) -> None:
+    for cfop in root.xpath(".//*[local-name()='det']/*[local-name()='prod']/*[local-name()='CFOP']"):
+        if (cfop.text or "").strip() == "3949":
+            cfop.text = "3102"
+            stats["cfop_ajustados"] += 1
+
+
 _CAMPOS_MONETARIOS_ICMS = [
     "vBC", "vICMS", "vICMSOp", "vICMSDif",
     "vBCSTRet", "vICMSSTRet", "vICMSST",
@@ -310,6 +322,13 @@ def _zerar_icms(root: etree._Element, stats: Dict) -> None:
                 infcpl.text = limpo
                 stats["infcpl_limpa"] += 1
 
+    icmstot = next(iter(root.xpath(".//*[local-name()='total']/*[local-name()='ICMSTot']")), None)
+    if icmstot is not None:
+        for campo in ["vBC", "vICMS"]:
+            no = next(iter(icmstot.xpath(f"./*[local-name()='{campo}']")), None)
+            if no is not None:
+                no.text = "0.00"
+
 
 # ---------------------------------------------------------------------------
 # 4. IPI — CST → 03 quando sem alíquota
@@ -362,6 +381,171 @@ def _ajustar_pis_cofins(root: etree._Element, stats: Dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 6. IBS / CBS - inclui grupos conforme espelho HAGN008
+# ---------------------------------------------------------------------------
+
+_IBS_CBS_CFG = {
+    "cst": "000",
+    "cclass_trib": "000001",
+    "p_ibs_uf": Decimal("0.1000"),
+    "p_ibs_mun": Decimal("0.0000"),
+    "p_cbs": Decimal("0.9000"),
+}
+
+
+def _fmt_q2(valor: Decimal) -> str:
+    return f"{_q2(valor):.2f}"
+
+
+def _fmt_q4(valor: Decimal) -> str:
+    return f"{valor.quantize(Decimal('0.0000'), rounding=ROUND_HALF_UP):.4f}"
+
+
+def _append_or_replace(parent: etree._Element, child: etree._Element, local_name: str) -> None:
+    existentes = [
+        no for no in parent
+        if isinstance(no.tag, str) and etree.QName(no).localname == local_name
+    ]
+    if existentes:
+        idx = parent.index(existentes[0])
+        for extra in existentes:
+            parent.remove(extra)
+        parent.insert(idx, child)
+    else:
+        parent.append(child)
+
+
+def _adicionar_ibscbs(root: etree._Element, stats: Dict, mapa_fiscal: Optional[Dict[str, Dict]] = None) -> None:
+    total_vbc = Decimal("0")
+    total_vibsuf = Decimal("0")
+    total_vibsmun = Decimal("0")
+    total_vibs = Decimal("0")
+    total_vcbs = Decimal("0")
+    mapa_fiscal = mapa_fiscal or {}
+
+    for det in root.xpath(".//*[local-name()='det']"):
+        imposto = next(iter(det.xpath("./*[local-name()='imposto']")), None)
+        prod = next(iter(det.xpath("./*[local-name()='prod']")), None)
+        if imposto is None or prod is None:
+            continue
+
+        ns_uri = _ns(imposto.tag) or _ns(det.tag)
+        sku = (_get_text(prod, "cProd") or "").strip()
+        fiscal = mapa_fiscal.get(sku, {})
+        ibs_cfg = fiscal.get("ibs", {}) if isinstance(fiscal, dict) else {}
+        cbs_cfg = fiscal.get("cbs", {}) if isinstance(fiscal, dict) else {}
+
+        vbc = _q2(
+            _dec(ibs_cfg.get("base"))
+            or _dec(cbs_cfg.get("base"))
+            or _dec(_get_text(prod, "vProd"))
+        )
+        p_ibs_uf = _dec(ibs_cfg.get("aliquota")) or _IBS_CBS_CFG["p_ibs_uf"]
+        p_ibs_mun = _IBS_CBS_CFG["p_ibs_mun"]
+        p_cbs = _dec(cbs_cfg.get("aliquota")) or _IBS_CBS_CFG["p_cbs"]
+
+        vibsuf = _q2(_dec(ibs_cfg.get("valor")) or (vbc * (p_ibs_uf / Decimal("100"))))
+        vibsmun = _q2(vbc * (p_ibs_mun / Decimal("100")))
+        vibs = _q2(vibsuf + vibsmun)
+        vcbs = _q2(_dec(cbs_cfg.get("valor")) or (vbc * (p_cbs / Decimal("100"))))
+
+        ibscbs = etree.Element(f"{{{ns_uri}}}IBSCBS" if ns_uri else "IBSCBS")
+        ibscbs.append(_mk(ns_uri, "CST", _IBS_CBS_CFG["cst"]))
+        ibscbs.append(_mk(ns_uri, "cClassTrib", _IBS_CBS_CFG["cclass_trib"]))
+
+        gibscbs = etree.Element(f"{{{ns_uri}}}gIBSCBS" if ns_uri else "gIBSCBS")
+        gibscbs.append(_mk(ns_uri, "vBC", _fmt_q2(vbc)))
+
+        gibsuf = etree.Element(f"{{{ns_uri}}}gIBSUF" if ns_uri else "gIBSUF")
+        gibsuf.append(_mk(ns_uri, "pIBSUF", _fmt_q4(p_ibs_uf)))
+        gibsuf.append(_mk(ns_uri, "vIBSUF", _fmt_q2(vibsuf)))
+        gibscbs.append(gibsuf)
+
+        gibsmun = etree.Element(f"{{{ns_uri}}}gIBSMun" if ns_uri else "gIBSMun")
+        gibsmun.append(_mk(ns_uri, "pIBSMun", _fmt_q4(p_ibs_mun)))
+        gibsmun.append(_mk(ns_uri, "vIBSMun", _fmt_q2(vibsmun)))
+        gibscbs.append(gibsmun)
+
+        gibscbs.append(_mk(ns_uri, "vIBS", _fmt_q2(vibs)))
+
+        gcbs = etree.Element(f"{{{ns_uri}}}gCBS" if ns_uri else "gCBS")
+        gcbs.append(_mk(ns_uri, "pCBS", _fmt_q4(p_cbs)))
+        gcbs.append(_mk(ns_uri, "vCBS", _fmt_q2(vcbs)))
+        gibscbs.append(gcbs)
+
+        ibscbs.append(gibscbs)
+        _append_or_replace(imposto, ibscbs, "IBSCBS")
+
+        total_vbc += vbc
+        total_vibsuf += vibsuf
+        total_vibsmun += vibsmun
+        total_vibs += vibs
+        total_vcbs += vcbs
+        stats["ibscbs_itens_gerados"] += 1
+
+    total = next(iter(root.xpath(".//*[local-name()='total']")), None)
+    icmstot = next(iter(root.xpath(".//*[local-name()='total']/*[local-name()='ICMSTot']")), None)
+    if total is None or icmstot is None:
+        return
+
+    ns_uri = _ns(total.tag) or _ns(icmstot.tag)
+    ibscbstot = etree.Element(f"{{{ns_uri}}}IBSCBSTot" if ns_uri else "IBSCBSTot")
+    ibscbstot.append(_mk(ns_uri, "vBCIBSCBS", _fmt_q2(total_vbc)))
+
+    gibs = etree.Element(f"{{{ns_uri}}}gIBS" if ns_uri else "gIBS")
+    gibsuf = etree.Element(f"{{{ns_uri}}}gIBSUF" if ns_uri else "gIBSUF")
+    gibsuf.append(_mk(ns_uri, "vDif", "0.00"))
+    gibsuf.append(_mk(ns_uri, "vDevTrib", "0.00"))
+    gibsuf.append(_mk(ns_uri, "vIBSUF", _fmt_q2(total_vibsuf)))
+    gibs.append(gibsuf)
+
+    gibsmun = etree.Element(f"{{{ns_uri}}}gIBSMun" if ns_uri else "gIBSMun")
+    gibsmun.append(_mk(ns_uri, "vDif", "0.00"))
+    gibsmun.append(_mk(ns_uri, "vDevTrib", "0.00"))
+    gibsmun.append(_mk(ns_uri, "vIBSMun", _fmt_q2(total_vibsmun)))
+    gibs.append(gibsmun)
+
+    gibs.append(_mk(ns_uri, "vIBS", _fmt_q2(total_vibs)))
+    gibs.append(_mk(ns_uri, "vCredPres", "0.00"))
+    gibs.append(_mk(ns_uri, "vCredPresCondSus", "0.00"))
+    ibscbstot.append(gibs)
+
+    gcbs = etree.Element(f"{{{ns_uri}}}gCBS" if ns_uri else "gCBS")
+    gcbs.append(_mk(ns_uri, "vDif", "0.00"))
+    gcbs.append(_mk(ns_uri, "vDevTrib", "0.00"))
+    gcbs.append(_mk(ns_uri, "vCBS", _fmt_q2(total_vcbs)))
+    gcbs.append(_mk(ns_uri, "vCredPres", "0.00"))
+    gcbs.append(_mk(ns_uri, "vCredPresCondSus", "0.00"))
+    ibscbstot.append(gcbs)
+
+    _append_or_replace(total, ibscbstot, "IBSCBSTot")
+
+    vnftot = etree.Element(f"{{{ns_uri}}}vNFTot" if ns_uri else "vNFTot")
+    vnftot.text = _fmt_q2(total_vbc)
+    existentes_vnftot = [
+        no for no in total
+        if isinstance(no.tag, str) and etree.QName(no).localname == "vNFTot"
+    ]
+    if existentes_vnftot:
+        idx_vnftot = total.index(existentes_vnftot[0])
+        for extra in existentes_vnftot:
+            total.remove(extra)
+        total.insert(idx_vnftot, vnftot)
+    else:
+        ibscbstot_existente = next(iter(
+            no for no in total
+            if isinstance(no.tag, str) and etree.QName(no).localname == "IBSCBSTot"
+        ), None)
+        if ibscbstot_existente is not None:
+            idx_insert = total.index(ibscbstot_existente) + 1
+        else:
+            idx_insert = total.index(icmstot) + 1
+        total.insert(idx_insert, vnftot)
+
+    stats["ibscbs_totais_gerados"] = 1
+
+
+# ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
 
@@ -369,6 +553,7 @@ def processar_xml(
     xml_bytes: bytes,
     mapa_ean: Dict[str, str],
     nome_arquivo: str,
+    mapa_fiscal: Optional[Dict[str, Dict]] = None,
 ) -> Tuple[Optional[bytes], Dict]:
     """
     Processa um único XML NF-e aplicando todas as regras.
@@ -399,23 +584,35 @@ def processar_xml(
     except Exception as e:
         stats["avisos"].append(f"Falha ao inserir cFabricante (ignorado): {e}")
 
-    # 3. ICMS zerado
+    # 3. CFOP
+    try:
+        _ajustar_cfop(root, stats)
+    except Exception as e:
+        stats["avisos"].append(f"Falha ao ajustar CFOP (ignorado): {e}")
+
+    # 4. ICMS zerado
     try:
         _zerar_icms(root, stats)
     except Exception as e:
         stats["avisos"].append(f"Falha ao zerar ICMS (ignorado): {e}")
 
-    # 4. IPI
+    # 5. IPI
     try:
         _ajustar_ipi(root, stats)
     except Exception as e:
         stats["avisos"].append(f"Falha ao ajustar IPI (ignorado): {e}")
 
-    # 5. PIS/COFINS
+    # 6. PIS/COFINS
     try:
         _ajustar_pis_cofins(root, stats)
     except Exception as e:
         stats["avisos"].append(f"Falha ao ajustar PIS/COFINS (ignorado): {e}")
+
+    # 7. IBS/CBS
+    try:
+        _adicionar_ibscbs(root, stats, mapa_fiscal)
+    except Exception as e:
+        stats["avisos"].append(f"Falha ao incluir IBS/CBS (ignorado): {e}")
 
     # Serializar
     try:
